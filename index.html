@@ -9,7 +9,10 @@
     <script>(function(){try{var t=localStorage.getItem('pcsi_theme');if(!t)t=matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';if(t==='dark')document.documentElement.classList.add('dark');}catch(e){}})();</script>
     
     <script>
-        MathJax = { tex: { inlineMath: [['$', '$'], ['\\(', '\\)']] } };
+        window.MathJax = {
+            tex: { inlineMath: [['$', '$'], ['\\(', '\\)']] },
+            startup: { typeset: false }
+        };
     </script>
     <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
 
@@ -448,7 +451,6 @@
                     }
                 } catch(e) { console.log("Cloud hors ligne, utilisation locale.", e); }
             }
-            Object.values(deckData).forEach(repairCardLaTeX);
             if (cleanDeck() > 0) saveData();
             updateDashboard();
             initCanvas();
@@ -583,46 +585,92 @@
         
         function generateId() { return 'c_' + Date.now().toString(36) + Math.random().toString(36).substr(2, 5); }
 
-        // Import
-        // Nettoyage des balises de citation laissées par l'IA : [cite: 3], [cite:1,2], [cite_start], [cite_end]...
+        // Nettoyage des balises de citation laissées par l'IA.
         const CITE_RE = /([ \t]*)\[\s*cite(?:_start|_end)?\s*(?::[^\]]*)?\]/gi;
-        // Répare les notations LaTeX sans altérer les antislashs valides.
-        function repairLaTeX(str) {
-            if (typeof str !== 'string') return str;
-            return str
-                .replace(/\\\|([^|\n]+)\\(?=\s*(?:$|[.,;:!?)]))/g, '\\|$1\\|')
-                .replace(/\\\|([^|\n]+)\|/g, '\\|$1\\|');
+        function cleanText(t) {
+            if (typeof t !== 'string') return t;
+            return t.replace(CITE_RE, (m, ws, off, str) => {
+                const next = str[off + m.length];
+                return (next && /[\p{L}\p{N}]/u.test(next)) ? ws : '';
+            }).trim();
+        }
+
+        function hasUnclosedMath(value) {
+            let mode = null, escaped = false;
+            const slash = String.fromCharCode(92);
+            for (let i = 0; i < value.length; i++) {
+                const ch = value[i], next = value[i + 1];
+                if (ch === slash && next === '(' && !escaped && !mode) {
+                    mode = 'paren'; i++; escaped = false; continue;
+                }
+                if (ch === slash && next === ')' && !escaped && mode === 'paren') {
+                    mode = null; i++; escaped = false; continue;
+                }
+                if (ch === '$' && !escaped) mode = mode === '$' ? null : (mode || '$');
+                escaped = ch === slash && !escaped;
+                if (ch !== slash) escaped = false;
+            }
+            return mode !== null;
+        }
+
+        function splitBulkLine(line) {
+            const fields = [];
+            let field = '', mode = null, escaped = false;
+            const slash = String.fromCharCode(92);
+            for (let i = 0; i < line.length; i++) {
+                const ch = line[i], next = line[i + 1];
+                if (ch === slash && next === '(' && !escaped && !mode) {
+                    mode = 'paren'; field += ch + next; i++; escaped = false; continue;
+                }
+                if (ch === slash && next === ')' && !escaped && mode === 'paren') {
+                    mode = null; field += ch + next; i++; escaped = false; continue;
+                }
+                if (ch === '$' && !escaped) mode = mode === '$' ? null : (mode || '$');
+                if (ch === '|' && !mode) {
+                    fields.push(cleanText(field.trim()));
+                    field = '';
+                } else {
+                    field += ch;
+                }
+                escaped = ch === slash && !escaped;
+                if (ch !== slash) escaped = false;
+            }
+            fields.push(cleanText(field.trim()));
+            return fields;
         }
 
         function repairCardLaTeX(card) {
-            if (!card || typeof card !== 'object') return;
-            // Répare les anciennes normes coupées entre la réponse et la remarque.
-            if (typeof card.a === 'string' && typeof card.expl === 'string' &&
-                /\\\s*$/.test(card.a) && /^\s*y-x\\/.test(card.expl)) {
-                card.a = card.a.replace(/\s*$/, '') + '|' + card.expl.trim() + '|';
-                card.expl = card.d1 || '';
-                card.d1 = card.d2 || '';
-                card.d2 = card.d3 || '';
-                card.d3 = '';
+            if (!card || typeof card !== 'object' || typeof card.a !== 'string') return false;
+            let answer = card.a;
+            if (!hasUnclosedMath(answer)) return false;
+
+            const oldFields = [card.expl || '', card.d1 || '', card.d2 || '', card.d3 || ''];
+            let consumed = 0;
+            for (const fragment of oldFields) {
+                answer += (answer.endsWith('|') ? '' : '|') + fragment;
+                consumed++;
+                if (!hasUnclosedMath(answer)) break;
             }
-            ['cat','q','a','expl','d1','d2','d3'].forEach(k => {
-                if (typeof card[k] === 'string') card[k] = repairLaTeX(card[k]);
-            });
+            if (consumed === 0 || hasUnclosedMath(answer)) return false;
+
+            const remaining = oldFields.slice(consumed);
+            card.a = answer;
+            card.expl = remaining[0] || '';
+            card.d1 = remaining[1] || '';
+            card.d2 = remaining[2] || '';
+            card.d3 = remaining[3] || '';
+            return true;
         }
 
-        function cleanText(t) {
-            if (typeof t !== 'string') return t;
-            const cleaned = t.replace(CITE_RE, (m, ws, off, str) => {
-                const next = str[off + m.length];
-                return (next && /[\p{L}\p{N}]/u.test(next)) ? ws : ''; // garde l'espace si du texte suit directement
-            }).trim();
-            return repairLaTeX(cleaned);
-        }
-        function cleanDeck() { // nettoie toutes les cartes existantes, renvoie le nombre de champs modifiés
+        function cleanDeck() {
             let n = 0;
             Object.values(deckData).forEach(c => {
+                if (repairCardLaTeX(c)) n++;
                 ['cat','q','a','expl','d1','d2','d3'].forEach(k => {
-                    if (typeof c[k] === 'string') { const v = cleanText(c[k]); if (v !== c[k]) { c[k] = v; n++; } }
+                    if (typeof c[k] === 'string') {
+                        const v = cleanText(c[k]);
+                        if (v !== c[k]) { c[k] = v; n++; }
+                    }
                 });
             });
             return n;
@@ -635,20 +683,7 @@
             let added = 0;
             lines.forEach(line => {
                 if(line.trim() === '') return;
-                // Protège les barres verticales dans $...$ et \\(...\\) avant le découpage.
-                const slash = String.fromCharCode(92), barToken = '\uE000';
-                let mathMode = null, escaped = false, protectedLine = '';
-                for (let i = 0; i < line.length; i++) {
-                    const ch = line[i], next = line[i + 1];
-                    if (ch === '$' && !escaped) mathMode = mathMode === '$' ? null : (mathMode || '$');
-                    if (ch === slash && next === '(' && !mathMode) { mathMode = 'paren'; protectedLine += ch + next; i++; escaped = false; continue; }
-                    if (ch === slash && next === ')' && mathMode === 'paren') { mathMode = null; protectedLine += ch + next; i++; escaped = false; continue; }
-                    if (ch === '|' && mathMode) protectedLine += barToken;
-                    else protectedLine += ch;
-                    escaped = ch === slash && !escaped;
-                    if (ch !== slash) escaped = false;
-                }
-                let parts = protectedLine.split('|').map(p => cleanText(p.replaceAll(barToken, '|').trim()));
+                let parts = splitBulkLine(line);
                 if(parts.length >= 3) {
                     let newCard = {
                         id: generateId(),
@@ -852,6 +887,7 @@
 
         function renderManage() {
             const list = document.getElementById('manage-list');
+            clearMath(list);
             list.innerHTML = '';
             const cards = Object.values(deckData).filter(c => c.cat === manageCat);
             if (!cards.length) { backToMain(); renderCourseGrid(); return; }
@@ -873,7 +909,7 @@
                 };
                 row.appendChild(txt); row.appendChild(del); list.appendChild(row);
             });
-            if (window.MathJax && MathJax.typesetPromise) MathJax.typesetPromise([list]);
+            typesetMath(list);
         }
 
         function deleteChapter() {
@@ -906,6 +942,7 @@
         function renderCourse() {
             const box = document.getElementById('course-content');
             const q = document.getElementById('course-search').value.trim().toLowerCase();
+            clearMath(box);
             box.innerHTML = '';
             let cards = Object.values(deckData).filter(c => (courseCat ? c.cat === courseCat : isChapterSelected(c.cat)) && matchType(c));
             if (q) cards = cards.filter(c => [c.q, c.a, c.expl, c.cat].join(' ').toLowerCase().includes(q));
@@ -933,7 +970,7 @@
                     box.appendChild(item);
                 });
             });
-            if (window.MathJax && MathJax.typesetPromise) MathJax.typesetPromise([box]);
+            typesetMath(box);
         }
 
         // Moteur de révision
@@ -970,6 +1007,8 @@
         function showCard() {
             if (currentIndex >= currentSession.length) return endSession();
 
+            const studyUI = document.getElementById('study-ui');
+            clearMath(studyUI);
             let card = currentSession[currentIndex];
             document.getElementById('card-category').innerText = card.cat + ' · ' + TYPES[cardType(card)].icon + ' ' + TYPES[cardType(card)].label;
             document.getElementById('question-text').innerText = card.q;
@@ -1009,9 +1048,7 @@
                 document.getElementById('flashcard-eval-zone').style.display = 'block';
             }
 
-            if (window.MathJax && MathJax.typesetPromise) {
-                MathJax.typesetPromise([document.getElementById('study-ui')]);
-            }
+            typesetMath(studyUI);
         }
 
         function handleQCMClick(clickedBtn) {
@@ -1143,1500 +1180,25 @@
             canvas.addEventListener('touchmove', draw, {passive: false});
         }
 
-        initApp();
-    </script>
-</body>
-</html> && !escaped) mathMode = mathMode === '
-                if(parts.length >= 3) {
-                    let newCard = {
-                        id: generateId(),
-                        cat: parts[0], q: parts[1], a: parts[2],
-                        expl: parts[3] || "",
-                        d1: parts[4] || "", d2: parts[5] || "", d3: parts[6] || "",
-                        type: normType(parts[7]),
-                        interval: 0, nextReview: Date.now(), reviews: 0, successes: 0, failures: 0
-                    };
-                    deckData[newCard.id] = newCard;
-                    added++;
-                }
-            });
-            if(added > 0) {
-                saveData(); 
-                document.getElementById('bulk-text').value = "";
-                alert(`${added} cartes importées avec succès !`);
-                updateDashboard();
-            }
+        function clearMath(element) {
+            const mj = window.MathJax;
+            if (mj && typeof mj.typesetClear === 'function' && element) mj.typesetClear([element]);
         }
 
-        // Dashboard
-        function updateDashboard() {
-            let due = 0, nev = 0;
-            let now = Date.now();
-            let dueByChap = {};
-
-            Object.values(deckData).forEach(c => {
-                if(!dueByChap[c.cat]) dueByChap[c.cat] = 0;
-                if (c.reviews === 0 && c.interval === 0) nev++;
-                if (c.nextReview <= now || (c.reviews === 0 && c.interval === 0)) {
-                    due++;
-                    dueByChap[c.cat]++;
-                }
-            });
-            
-            document.getElementById('stat-due').innerText = due;
-            document.getElementById('stat-new').innerText = nev;
-
-            let chapListHTML = '';
-            let sortedChaps = Object.keys(dueByChap).sort();
-            sortedChaps.forEach(chap => {
-                if(dueByChap[chap] > 0) {
-                    chapListHTML += `<div class="list-item"><span>${chap}</span> <span class="score-badge score-bad">${dueByChap[chap]} à revoir</span></div>`;
-                }
-            });
-            document.getElementById('due-by-chapter-list').innerHTML = chapListHTML || "<p style='color:#10b981; font-weight:bold;'>Tout est à jour, bravo ! 🎉</p>";
-            renderChapterPicker();
+        function typesetMath(element) {
+            const mj = window.MathJax;
+            if (!mj || typeof mj.typesetPromise !== 'function') return;
+            mj.typesetPromise(element ? [element] : undefined)
+                .catch(error => console.error('Erreur MathJax :', error));
         }
 
-        function renderCourseGrid() {
-            const grid = document.getElementById('course-grid');
-            grid.innerHTML = "";
-            let tot = {}, match = {};
-            Object.values(deckData).forEach(c => { tot[c.cat] = (tot[c.cat] || 0) + 1; if (matchType(c)) match[c.cat] = (match[c.cat] || 0) + 1; });
-            const filtered = getTypeFilter().size > 0;
-            Object.keys(tot).sort().forEach(cat => {
-                let div = document.createElement('div');
-                div.className = "course-card";
-                div.onclick = () => startSession('specific', cat);
-                div.innerHTML = `<div class="course-title"></div><div style="font-size:0.85em;color:#64748b;"></div>`;
-                div.querySelector('.course-title').textContent = cat;
-                div.lastChild.textContent = filtered ? `${match[cat] || 0} / ${tot[cat]} cartes` : `${tot[cat]} cartes`;
-                const mb = document.createElement('button');
-                mb.className = 'course-manage';
-                mb.textContent = '⚙️ Gérer / supprimer';
-                mb.onclick = (e) => { e.stopPropagation(); openManage(cat); };
-                div.appendChild(mb);
-                grid.appendChild(div);
-            });
-            renderTypePicker();
-        }
-
-        // Sélection des chapitres à réviser (on mémorise les chapitres exclus)
-        const EXCL_KEY = 'pcsi_chap_excl';
-        function getExcluded() { try { return new Set(JSON.parse(localStorage.getItem(EXCL_KEY)) || []); } catch(e) { return new Set(); } }
-        function isChapterSelected(cat) { return !getExcluded().has(cat); }
-
-        // ----- Types de contenu (définition / proposition / méthode) -----
-        const TYPES = {
-            def:   { label:'Définition',  plural:'Définitions',  icon:'📘' },
-            prop:  { label:'Proposition', plural:'Propositions', icon:'📐' },
-            meth:  { label:'Méthode',     plural:'Méthodes',     icon:'🛠️' },
-            autre: { label:'Autre',       plural:'Autres',       icon:'📝' }
-        };
-        const TYPE_KEY = 'pcsi_type_filter';
-        function guessType(c) { // détection approximative d'après la question
-            const q = (c.q || '');
-            if (/m[ée]thode|comment\s+(?!s'appelle|note|d[ée]finit|appelle)|proc[ée]d(er|ure)|technique|algorithme|strat[ée]gie|[ée]tapes?\b|astuce|r[ée]flexe|que (faire|fait-on)|pour (calculer|d[ée]montrer|montrer|prouver|r[ée]soudre|d[ée]terminer|[ée]tudier|trouver)/i.test(q)) return 'meth';
-            if (/d[ée]finition|d[ée]finir|d[ée]fini(t|e)\b|qu'appelle|on appelle|qu'est-ce qu|que signifie|que veut dire|notion de|d[ée]signe|se note|notation/i.test(q)) return 'def';
-            if (/proposition|th[ée]or[èe]me|lemme|corollaire|propri[ée]t[ée]|[ée]nonc|formule|in[ée]galit[ée]|crit[èe]re|caract[ée]ris|r[èe]gle|condition (n[ée]cessaire|suffisante)|relation|identit[ée]|d[ée]veloppement limit/i.test(q)) return 'prop';
-            return 'autre';
-        }
-        function cardType(c) { return TYPES[c.type] ? c.type : guessType(c); }
-        function normType(t) {
-            if (!t) return undefined;
-            if (/d[ée]f/i.test(t)) return 'def';
-            if (/m[ée]th/i.test(t)) return 'meth';
-            if (/prop|th[ée]or|lemme|corol|propri/i.test(t)) return 'prop';
-            if (/autre/i.test(t)) return 'autre';
-            return undefined;
-        }
-        function getTypeFilter() { try { return new Set(JSON.parse(localStorage.getItem(TYPE_KEY)) || []); } catch(e) { return new Set(); } }
-        function matchType(c) { const f = getTypeFilter(); return f.size === 0 || f.has(cardType(c)); }
-        function typeSuffix() { const f = [...getTypeFilter()]; return f.length ? ' · ' + f.map(t => TYPES[t].plural).join(', ') : ''; }
-        function tbadge(c) { const t = TYPES[cardType(c)]; const b = document.createElement('div'); b.className = 'tbadge'; b.textContent = t.icon + ' ' + t.label; return b; }
-
-        function makeChip(label, on, fn, count) {
-            const b = document.createElement('button'); b.type = 'button';
-            b.className = 'chip' + (on ? ' on' : ''); b.textContent = label;
-            if (count != null) { const sm = document.createElement('small'); sm.textContent = count; b.appendChild(sm); }
-            b.onclick = fn; return b;
-        }
-
-        function renderTypePicker() {
-            const f = getTypeFilter();
-            const counts = { def:0, prop:0, meth:0, autre:0 };
-            Object.values(deckData).forEach(c => counts[cardType(c)]++);
-            const save = (set) => {
-                if (set.size === Object.keys(TYPES).length) set.clear();
-                localStorage.setItem(TYPE_KEY, JSON.stringify([...set]));
-                renderTypePicker(); if (document.getElementById('tab-courses').classList.contains('active')) renderCourseGrid();
-            };
-            document.querySelectorAll('.type-chips').forEach(box => {
-                box.innerHTML = '';
-                box.appendChild(makeChip('Tout', f.size === 0, () => save(new Set())));
-                Object.keys(TYPES).forEach(t => box.appendChild(makeChip(TYPES[t].icon + ' ' + TYPES[t].plural, f.has(t), () => {
-                    const n = getTypeFilter(); if (n.has(t)) n.delete(t); else n.add(t); save(n);
-                }, counts[t])));
-            });
-            document.querySelectorAll('.type-sub').forEach(e => e.innerText = f.size ? 'filtre actif' : 'tous');
-        }
-
-        // ----- Chapitres : chips (« Tout » actif = aucun filtre ; un clic sélectionne seulement ce chapitre) -----
-        function renderChapterPicker() {
-            const list = document.getElementById('chap-picker-list');
-            const excl = getExcluded();
-            const counts = {};
-            Object.values(deckData).forEach(c => { counts[c.cat] = (counts[c.cat] || 0) + 1; });
-            const cats = Object.keys(counts).sort();
-            const allOn = cats.every(c => !excl.has(c));
-            const store = (e) => { localStorage.setItem(EXCL_KEY, JSON.stringify([...e])); renderChapterPicker(); };
-            list.innerHTML = '';
-            if (!cats.length) list.innerHTML = "<span style='color:#64748b; font-size:0.9em;'>Aucun chapitre pour le moment.</span>";
-            else list.appendChild(makeChip('Tout', allOn, () => store(new Set())));
-            cats.forEach(cat => list.appendChild(makeChip(cat, !allOn && !excl.has(cat), () => {
-                const e = getExcluded();
-                if (cats.every(c => !e.has(c))) cats.forEach(c => { if (c !== cat) e.add(c); }); // tout actif -> seulement celui-ci
-                else { if (e.has(cat)) e.delete(cat); else e.add(cat); if (cats.every(c => e.has(c))) e.clear(); }
-                store(e);
-            }, counts[cat])));
-            document.getElementById('chap-picker-title').innerText = allOn ? 'tous' : cats.filter(c => !excl.has(c)).length + ' sur ' + cats.length;
-            renderTypePicker();
-        }
-
-        function setAllChapters(on) {
-            localStorage.setItem(EXCL_KEY, JSON.stringify(on ? [] : [...new Set(Object.values(deckData).map(c => c.cat))]));
-            renderChapterPicker();
-        }
-
-        // ----- Thème & zone cloud -----
-        function updateThemeBtn() {
-            const dark = document.documentElement.classList.contains('dark');
-            const b = document.getElementById('theme-btn'); if (b) b.innerText = dark ? '☀️' : '🌙';
-            const m = document.querySelector('meta[name=theme-color]'); if (m) m.content = dark ? '#0b1220' : '#2563eb';
-        }
-        function toggleTheme() {
-            const dark = document.documentElement.classList.toggle('dark');
-            localStorage.setItem('pcsi_theme', dark ? 'dark' : 'light');
-            updateThemeBtn();
-        }
-        const CLOUD_STATE_KEY = 'pcsi_cloud_state';
-        function updateCloudMini() {
-            const e = document.getElementById('cloud-mini-status');
-            if (e) e.innerText = cloudBin ? '✅ Synchronisation active' : 'Non configurée';
-        }
-        function applyCloudState() {
-            const st = localStorage.getItem(CLOUD_STATE_KEY) || (cloudBin ? 'min' : 'open');
-            document.getElementById('cloud-setup').style.display = (st === 'hidden') ? 'none' : 'block';
-            document.getElementById('cloud-restore').style.display = (st === 'hidden') ? 'block' : 'none';
-            document.getElementById('cloud-body').style.display = (st === 'open') ? 'block' : 'none';
-            document.getElementById('cloud-toggle').innerText = (st === 'open') ? '▾' : '▸';
-            updateCloudMini();
-        }
-        function setCloudState(st) { localStorage.setItem(CLOUD_STATE_KEY, st); applyCloudState(); }
-        function toggleCloudBody() {
-            const st = localStorage.getItem(CLOUD_STATE_KEY) || (cloudBin ? 'min' : 'open');
-            setCloudState(st === 'open' ? 'min' : 'open');
-        }
-
-        // Gestion / suppression
-        let manageCat = null;
-        function openManage(cat) {
-            manageCat = cat;
-            document.getElementById('main-interface').style.display = 'none';
-            document.getElementById('manage-ui').style.display = 'block';
-            document.getElementById('manage-title').innerText = '⚙️ ' + cat;
-            renderManage();
-            window.scrollTo(0, 0);
-        }
-
-        function renderManage() {
-            const list = document.getElementById('manage-list');
-            list.innerHTML = '';
-            const cards = Object.values(deckData).filter(c => c.cat === manageCat);
-            if (!cards.length) { backToMain(); renderCourseGrid(); return; }
-            cards.forEach(c => {
-                const row = document.createElement('div'); row.className = 'manage-row';
-                const txt = document.createElement('div'); txt.className = 'txt';
-                const q = document.createElement('div'); q.style.fontWeight = 'bold'; q.textContent = c.q;
-                const a = document.createElement('div'); a.style.cssText = 'font-size:0.85em;color:#64748b;'; a.textContent = '→ ' + c.a;
-                const sel = document.createElement('select'); sel.className = 'manage-type';
-                Object.keys(TYPES).forEach(t => { const o = document.createElement('option'); o.value = t; o.textContent = TYPES[t].icon + ' ' + TYPES[t].label; sel.appendChild(o); });
-                sel.value = cardType(c);
-                sel.onchange = () => { c.type = sel.value; saveData(); renderTypePicker(); };
-                txt.appendChild(q); txt.appendChild(a); txt.appendChild(sel);
-                const del = document.createElement('button'); del.className = 'manage-del'; del.textContent = '🗑';
-                del.setAttribute('aria-label', 'Supprimer cette question');
-                del.onclick = () => {
-                    if (!confirm('Supprimer cette question ?')) return;
-                    delete deckData[c.id]; saveData(); renderManage(); renderCourseGrid();
-                };
-                row.appendChild(txt); row.appendChild(del); list.appendChild(row);
-            });
-            if (window.MathJax && MathJax.typesetPromise) MathJax.typesetPromise([list]);
-        }
-
-        function deleteChapter() {
-            const ids = Object.values(deckData).filter(c => c.cat === manageCat).map(c => c.id);
-            if (!confirm('Supprimer définitivement les ' + ids.length + ' questions du chapitre « ' + manageCat + ' » ?')) return;
-            ids.forEach(id => delete deckData[id]);
-            saveData(); backToMain(); renderCourseGrid();
-        }
-
-        // Mode Cours (lecture seule, n'affecte pas la progression)
-        let courseCat = null;
-
-        function onModeChange(silent) {
-            const m = document.getElementById('study-mode-toggle').value;
-            if (!silent) localStorage.setItem('pcsi_mode', m);
-            document.getElementById('btn-start').innerText = (m === 'course') ? '📖 Ouvrir tout le cours' : '🚀 Lancer les révisions du jour';
-        }
-
-        function openCourse(cat) {
-            courseCat = cat;
-            if (Object.keys(deckData).length === 0) return alert("Aucun contenu pour le moment : importe d'abord des cartes.");
-            document.getElementById('main-interface').style.display = 'none';
-            document.getElementById('course-ui').style.display = 'block';
-            document.getElementById('course-title').innerText = '📖 ' + (cat || 'Cours (chapitres sélectionnés)') + typeSuffix();
-            document.getElementById('course-search').value = '';
-            renderCourse();
-            window.scrollTo(0, 0);
-        }
-
-        function renderCourse() {
-            const box = document.getElementById('course-content');
-            const q = document.getElementById('course-search').value.trim().toLowerCase();
-            box.innerHTML = '';
-            let cards = Object.values(deckData).filter(c => (courseCat ? c.cat === courseCat : isChapterSelected(c.cat)) && matchType(c));
-            if (q) cards = cards.filter(c => [c.q, c.a, c.expl, c.cat].join(' ').toLowerCase().includes(q));
-            if (cards.length === 0) { box.innerHTML = "<p style='color:#64748b;'>Aucun résultat (vérifie le filtre de type de contenu).</p>"; return; }
-
-            let groups = {};
-            cards.forEach(c => { (groups[c.cat] = groups[c.cat] || []).push(c); });
-            Object.keys(groups).sort().forEach(cat => {
-                if (!courseCat) {
-                    const h = document.createElement('h3');
-                    h.className = 'course-chap';
-                    h.textContent = cat + ' (' + groups[cat].length + ')';
-                    box.appendChild(h);
-                }
-                groups[cat].forEach(c => {
-                    const item = document.createElement('div'); item.className = 'course-item';
-                    const topic = document.createElement('div'); topic.className = 'course-topic'; topic.textContent = c.q;
-                    const key = document.createElement('div'); key.className = 'course-key'; key.textContent = c.a;
-                    item.appendChild(tbadge(c)); item.appendChild(topic); item.appendChild(key);
-                    if (c.expl) {
-                        const ex = document.createElement('div'); ex.className = 'course-expl';
-                        ex.textContent = '💡 ' + c.expl;
-                        item.appendChild(ex);
-                    }
-                    box.appendChild(item);
-                });
-            });
-            if (window.MathJax && MathJax.typesetPromise) MathJax.typesetPromise([box]);
-        }
-
-        // Moteur de révision
-        function startSession(mode, category) {
-            if (document.getElementById('study-mode-toggle').value === 'course')
-                return openCourse(mode === 'specific' ? category : null);
-            isQCMMode = document.getElementById('study-mode-toggle').value === 'qcm';
-            let now = Date.now();
-            let allCards = Object.values(deckData);
-
-            if (mode === 'due') currentSession = allCards.filter(c => c.nextReview <= now && isChapterSelected(c.cat) && matchType(c));
-            else if (mode === 'specific') currentSession = allCards.filter(c => c.cat === category && matchType(c));
-            else currentSession = allCards.filter(c => isChapterSelected(c.cat) && matchType(c));
-
-            currentSession.sort(() => Math.random() - 0.5);
-
-            if (currentSession.length === 0) return alert("Rien à réviser avec ces filtres (chapitres / type de contenu) pour le moment !");
-            
-            currentIndex = 0;
-            document.getElementById('main-interface').style.display = 'none';
-            document.getElementById('study-ui').style.display = 'block';
-            
-            document.getElementById('scratchpad-wrapper').style.display = 'none';
-            clearCanvas();
-            document.getElementById('cloud-save-indicator').innerText = "";
-
-            showCard();
-        }
-
-        function shuffleArray(arr) {
-            return arr.sort(() => Math.random() - 0.5);
-        }
-
-        function showCard() {
-            if (currentIndex >= currentSession.length) return endSession();
-
-            let card = currentSession[currentIndex];
-            document.getElementById('card-category').innerText = card.cat + ' · ' + TYPES[cardType(card)].icon + ' ' + TYPES[cardType(card)].label;
-            document.getElementById('question-text').innerText = card.q;
-            document.getElementById('answer-text').innerText = card.a;
-            
-            let explBox = document.getElementById('mini-cours');
-            if(card.expl) { explBox.style.display = 'block'; document.getElementById('expl-text').innerText = card.expl; } 
-            else { explBox.style.display = 'none'; }
-            
-            document.getElementById('card-badge').innerText = card.reviews === 0 ? "NOUVELLE" : `RÉVISION`;
-            document.getElementById('card-badge').className = card.reviews === 0 ? "badge badge-new" : "badge badge-review";
-
-            document.getElementById('answer-box').style.display = 'none';
-            document.getElementById('flashcard-eval-zone').style.display = 'none';
-            document.getElementById('btn-next-qcm').style.display = 'none';
-
-            let hasDistractors = card.d1 && card.d1.trim() !== "";
-            
-            if (isQCMMode && hasDistractors) {
-                document.getElementById('btn-show-answer').style.display = 'none';
-                let qcmBox = document.getElementById('qcm-box');
-                qcmBox.style.display = 'flex';
-                qcmBox.innerHTML = '';
-                
-                let options = shuffleArray([card.a, card.d1, card.d2, card.d3].filter(x => x && x.trim()!==""));
-                options.forEach(opt => {
-                    let btn = document.createElement('button');
-                    btn.className = "qcm-btn";
-                    btn.innerText = opt;
-                    btn.dataset.correct = (opt === card.a) ? "true" : "false";
-                    btn.onclick = () => handleQCMClick(btn);
-                    qcmBox.appendChild(btn);
-                });
+        const mathJaxScript = document.getElementById('MathJax-script');
+        if (mathJaxScript) {
+            if (window.MathJax && typeof window.MathJax.typesetPromise === 'function') {
+                typesetMath(document.body);
             } else {
-                document.getElementById('qcm-box').style.display = 'none';
-                document.getElementById('btn-show-answer').style.display = 'block';
-                document.getElementById('flashcard-eval-zone').style.display = 'block';
+                mathJaxScript.addEventListener('load', () => typesetMath(document.body), { once: true });
             }
-
-            if(window.MathJax) MathJax.typesetPromise();
-        }
-
-        function handleQCMClick(clickedBtn) {
-            let allBtns = document.querySelectorAll('.qcm-btn');
-            allBtns.forEach(b => b.disabled = true);
-            
-            if (clickedBtn.dataset.correct === "true") {
-                clickedBtn.classList.add('correct');
-                currentQCMScore = 3; 
-            } else {
-                clickedBtn.classList.add('wrong');
-                allBtns.forEach(b => { if(b.dataset.correct === "true") b.classList.add('correct'); });
-                currentQCMScore = 0; 
-            }
-            
-            document.getElementById('answer-box').style.display = 'block';
-            document.getElementById('btn-next-qcm').style.display = 'block';
-        }
-
-        function nextQCMCard() {
-            evalCard(currentQCMScore);
-        }
-
-        function showAnswer() {
-            document.getElementById('btn-show-answer').style.display = 'none';
-            document.getElementById('answer-box').style.display = 'block';
-        }
-
-        function evalCard(quality) {
-            let card = deckData[currentSession[currentIndex].id];
-            card.reviews++;
-
-            if (quality === 0) { card.interval = 0; card.failures++; } 
-            else {
-                card.successes++;
-                if (card.interval === 0) card.interval = 1;
-                else if (card.interval === 1) card.interval = 3;
-                else card.interval = Math.round(card.interval * 1.5);
-            }
-
-            card.nextReview = Date.now() + (card.interval * 24 * 60 * 60 * 1000);
-            
-            saveData();
-            
-            clearCanvas();
-            currentIndex++;
-            showCard();
-        }
-
-        function endSession() {
-            backToMain();
-        }
-
-        // ==========================================
-        // GESTION DU BROUILLON
-        // ==========================================
-        const canvas = document.getElementById('brouillon-canvas');
-        const ctx = canvas.getContext('2d');
-        let isDrawing = false;
-        let currentTool = 'pen';
-
-        function toggleScratchpad() {
-            const wrapper = document.getElementById('scratchpad-wrapper');
-            if (wrapper.style.display === 'none' || wrapper.style.display === '') {
-                wrapper.style.display = 'block';
-                canvas.width = wrapper.clientWidth;
-                canvas.height = 300;
-                clearCanvas();
-            } else {
-                wrapper.style.display = 'none';
-            }
-        }
-
-        function setTool(tool) {
-            currentTool = tool;
-            document.getElementById('tool-pen').classList.remove('active-tool');
-            document.getElementById('tool-eraser').classList.remove('active-tool');
-            document.getElementById('tool-' + tool).classList.add('active-tool');
-        }
-
-        function clearCanvas() {
-            ctx.fillStyle = "#ffffff";
-            ctx.fillRect(0, 0, canvas.width, canvas.height);
-        }
-
-        function getPos(e) {
-            let rect = canvas.getBoundingClientRect();
-            let clientX = e.clientX;
-            let clientY = e.clientY;
-            if(e.touches && e.touches.length > 0) {
-                clientX = e.touches[0].clientX;
-                clientY = e.touches[0].clientY;
-            }
-            return { x: clientX - rect.left, y: clientY - rect.top };
-        }
-
-        function startPosition(e) {
-            isDrawing = true;
-            draw(e);
-        }
-
-        function endPosition() {
-            isDrawing = false;
-            ctx.beginPath();
-        }
-
-        function draw(e) {
-            if (!isDrawing) return;
-            e.preventDefault(); 
-            let pos = getPos(e);
-            
-            ctx.lineWidth = currentTool === 'eraser' ? 25 : 3;
-            ctx.lineCap = 'round';
-            ctx.strokeStyle = currentTool === 'eraser' ? '#ffffff' : '#0f172a';
-            
-            ctx.lineTo(pos.x, pos.y);
-            ctx.stroke();
-            ctx.beginPath();
-            ctx.moveTo(pos.x, pos.y);
-        }
-
-        function initCanvas() {
-            canvas.addEventListener('mousedown', startPosition);
-            canvas.addEventListener('mouseup', endPosition);
-            canvas.addEventListener('mousemove', draw);
-            canvas.addEventListener('mouseout', endPosition);
-            canvas.addEventListener('touchstart', startPosition, {passive: false});
-            canvas.addEventListener('touchend', endPosition);
-            canvas.addEventListener('touchmove', draw, {passive: false});
-        }
-
-        initApp();
-    </script>
-</body>
-</html> ? null : (mathMode || '
-                if(parts.length >= 3) {
-                    let newCard = {
-                        id: generateId(),
-                        cat: parts[0], q: parts[1], a: parts[2],
-                        expl: parts[3] || "",
-                        d1: parts[4] || "", d2: parts[5] || "", d3: parts[6] || "",
-                        type: normType(parts[7]),
-                        interval: 0, nextReview: Date.now(), reviews: 0, successes: 0, failures: 0
-                    };
-                    deckData[newCard.id] = newCard;
-                    added++;
-                }
-            });
-            if(added > 0) {
-                saveData(); 
-                document.getElementById('bulk-text').value = "";
-                alert(`${added} cartes importées avec succès !`);
-                updateDashboard();
-            }
-        }
-
-        // Dashboard
-        function updateDashboard() {
-            let due = 0, nev = 0;
-            let now = Date.now();
-            let dueByChap = {};
-
-            Object.values(deckData).forEach(c => {
-                if(!dueByChap[c.cat]) dueByChap[c.cat] = 0;
-                if (c.reviews === 0 && c.interval === 0) nev++;
-                if (c.nextReview <= now || (c.reviews === 0 && c.interval === 0)) {
-                    due++;
-                    dueByChap[c.cat]++;
-                }
-            });
-            
-            document.getElementById('stat-due').innerText = due;
-            document.getElementById('stat-new').innerText = nev;
-
-            let chapListHTML = '';
-            let sortedChaps = Object.keys(dueByChap).sort();
-            sortedChaps.forEach(chap => {
-                if(dueByChap[chap] > 0) {
-                    chapListHTML += `<div class="list-item"><span>${chap}</span> <span class="score-badge score-bad">${dueByChap[chap]} à revoir</span></div>`;
-                }
-            });
-            document.getElementById('due-by-chapter-list').innerHTML = chapListHTML || "<p style='color:#10b981; font-weight:bold;'>Tout est à jour, bravo ! 🎉</p>";
-            renderChapterPicker();
-        }
-
-        function renderCourseGrid() {
-            const grid = document.getElementById('course-grid');
-            grid.innerHTML = "";
-            let tot = {}, match = {};
-            Object.values(deckData).forEach(c => { tot[c.cat] = (tot[c.cat] || 0) + 1; if (matchType(c)) match[c.cat] = (match[c.cat] || 0) + 1; });
-            const filtered = getTypeFilter().size > 0;
-            Object.keys(tot).sort().forEach(cat => {
-                let div = document.createElement('div');
-                div.className = "course-card";
-                div.onclick = () => startSession('specific', cat);
-                div.innerHTML = `<div class="course-title"></div><div style="font-size:0.85em;color:#64748b;"></div>`;
-                div.querySelector('.course-title').textContent = cat;
-                div.lastChild.textContent = filtered ? `${match[cat] || 0} / ${tot[cat]} cartes` : `${tot[cat]} cartes`;
-                const mb = document.createElement('button');
-                mb.className = 'course-manage';
-                mb.textContent = '⚙️ Gérer / supprimer';
-                mb.onclick = (e) => { e.stopPropagation(); openManage(cat); };
-                div.appendChild(mb);
-                grid.appendChild(div);
-            });
-            renderTypePicker();
-        }
-
-        // Sélection des chapitres à réviser (on mémorise les chapitres exclus)
-        const EXCL_KEY = 'pcsi_chap_excl';
-        function getExcluded() { try { return new Set(JSON.parse(localStorage.getItem(EXCL_KEY)) || []); } catch(e) { return new Set(); } }
-        function isChapterSelected(cat) { return !getExcluded().has(cat); }
-
-        // ----- Types de contenu (définition / proposition / méthode) -----
-        const TYPES = {
-            def:   { label:'Définition',  plural:'Définitions',  icon:'📘' },
-            prop:  { label:'Proposition', plural:'Propositions', icon:'📐' },
-            meth:  { label:'Méthode',     plural:'Méthodes',     icon:'🛠️' },
-            autre: { label:'Autre',       plural:'Autres',       icon:'📝' }
-        };
-        const TYPE_KEY = 'pcsi_type_filter';
-        function guessType(c) { // détection approximative d'après la question
-            const q = (c.q || '');
-            if (/m[ée]thode|comment\s+(?!s'appelle|note|d[ée]finit|appelle)|proc[ée]d(er|ure)|technique|algorithme|strat[ée]gie|[ée]tapes?\b|astuce|r[ée]flexe|que (faire|fait-on)|pour (calculer|d[ée]montrer|montrer|prouver|r[ée]soudre|d[ée]terminer|[ée]tudier|trouver)/i.test(q)) return 'meth';
-            if (/d[ée]finition|d[ée]finir|d[ée]fini(t|e)\b|qu'appelle|on appelle|qu'est-ce qu|que signifie|que veut dire|notion de|d[ée]signe|se note|notation/i.test(q)) return 'def';
-            if (/proposition|th[ée]or[èe]me|lemme|corollaire|propri[ée]t[ée]|[ée]nonc|formule|in[ée]galit[ée]|crit[èe]re|caract[ée]ris|r[èe]gle|condition (n[ée]cessaire|suffisante)|relation|identit[ée]|d[ée]veloppement limit/i.test(q)) return 'prop';
-            return 'autre';
-        }
-        function cardType(c) { return TYPES[c.type] ? c.type : guessType(c); }
-        function normType(t) {
-            if (!t) return undefined;
-            if (/d[ée]f/i.test(t)) return 'def';
-            if (/m[ée]th/i.test(t)) return 'meth';
-            if (/prop|th[ée]or|lemme|corol|propri/i.test(t)) return 'prop';
-            if (/autre/i.test(t)) return 'autre';
-            return undefined;
-        }
-        function getTypeFilter() { try { return new Set(JSON.parse(localStorage.getItem(TYPE_KEY)) || []); } catch(e) { return new Set(); } }
-        function matchType(c) { const f = getTypeFilter(); return f.size === 0 || f.has(cardType(c)); }
-        function typeSuffix() { const f = [...getTypeFilter()]; return f.length ? ' · ' + f.map(t => TYPES[t].plural).join(', ') : ''; }
-        function tbadge(c) { const t = TYPES[cardType(c)]; const b = document.createElement('div'); b.className = 'tbadge'; b.textContent = t.icon + ' ' + t.label; return b; }
-
-        function makeChip(label, on, fn, count) {
-            const b = document.createElement('button'); b.type = 'button';
-            b.className = 'chip' + (on ? ' on' : ''); b.textContent = label;
-            if (count != null) { const sm = document.createElement('small'); sm.textContent = count; b.appendChild(sm); }
-            b.onclick = fn; return b;
-        }
-
-        function renderTypePicker() {
-            const f = getTypeFilter();
-            const counts = { def:0, prop:0, meth:0, autre:0 };
-            Object.values(deckData).forEach(c => counts[cardType(c)]++);
-            const save = (set) => {
-                if (set.size === Object.keys(TYPES).length) set.clear();
-                localStorage.setItem(TYPE_KEY, JSON.stringify([...set]));
-                renderTypePicker(); if (document.getElementById('tab-courses').classList.contains('active')) renderCourseGrid();
-            };
-            document.querySelectorAll('.type-chips').forEach(box => {
-                box.innerHTML = '';
-                box.appendChild(makeChip('Tout', f.size === 0, () => save(new Set())));
-                Object.keys(TYPES).forEach(t => box.appendChild(makeChip(TYPES[t].icon + ' ' + TYPES[t].plural, f.has(t), () => {
-                    const n = getTypeFilter(); if (n.has(t)) n.delete(t); else n.add(t); save(n);
-                }, counts[t])));
-            });
-            document.querySelectorAll('.type-sub').forEach(e => e.innerText = f.size ? 'filtre actif' : 'tous');
-        }
-
-        // ----- Chapitres : chips (« Tout » actif = aucun filtre ; un clic sélectionne seulement ce chapitre) -----
-        function renderChapterPicker() {
-            const list = document.getElementById('chap-picker-list');
-            const excl = getExcluded();
-            const counts = {};
-            Object.values(deckData).forEach(c => { counts[c.cat] = (counts[c.cat] || 0) + 1; });
-            const cats = Object.keys(counts).sort();
-            const allOn = cats.every(c => !excl.has(c));
-            const store = (e) => { localStorage.setItem(EXCL_KEY, JSON.stringify([...e])); renderChapterPicker(); };
-            list.innerHTML = '';
-            if (!cats.length) list.innerHTML = "<span style='color:#64748b; font-size:0.9em;'>Aucun chapitre pour le moment.</span>";
-            else list.appendChild(makeChip('Tout', allOn, () => store(new Set())));
-            cats.forEach(cat => list.appendChild(makeChip(cat, !allOn && !excl.has(cat), () => {
-                const e = getExcluded();
-                if (cats.every(c => !e.has(c))) cats.forEach(c => { if (c !== cat) e.add(c); }); // tout actif -> seulement celui-ci
-                else { if (e.has(cat)) e.delete(cat); else e.add(cat); if (cats.every(c => e.has(c))) e.clear(); }
-                store(e);
-            }, counts[cat])));
-            document.getElementById('chap-picker-title').innerText = allOn ? 'tous' : cats.filter(c => !excl.has(c)).length + ' sur ' + cats.length;
-            renderTypePicker();
-        }
-
-        function setAllChapters(on) {
-            localStorage.setItem(EXCL_KEY, JSON.stringify(on ? [] : [...new Set(Object.values(deckData).map(c => c.cat))]));
-            renderChapterPicker();
-        }
-
-        // ----- Thème & zone cloud -----
-        function updateThemeBtn() {
-            const dark = document.documentElement.classList.contains('dark');
-            const b = document.getElementById('theme-btn'); if (b) b.innerText = dark ? '☀️' : '🌙';
-            const m = document.querySelector('meta[name=theme-color]'); if (m) m.content = dark ? '#0b1220' : '#2563eb';
-        }
-        function toggleTheme() {
-            const dark = document.documentElement.classList.toggle('dark');
-            localStorage.setItem('pcsi_theme', dark ? 'dark' : 'light');
-            updateThemeBtn();
-        }
-        const CLOUD_STATE_KEY = 'pcsi_cloud_state';
-        function updateCloudMini() {
-            const e = document.getElementById('cloud-mini-status');
-            if (e) e.innerText = cloudBin ? '✅ Synchronisation active' : 'Non configurée';
-        }
-        function applyCloudState() {
-            const st = localStorage.getItem(CLOUD_STATE_KEY) || (cloudBin ? 'min' : 'open');
-            document.getElementById('cloud-setup').style.display = (st === 'hidden') ? 'none' : 'block';
-            document.getElementById('cloud-restore').style.display = (st === 'hidden') ? 'block' : 'none';
-            document.getElementById('cloud-body').style.display = (st === 'open') ? 'block' : 'none';
-            document.getElementById('cloud-toggle').innerText = (st === 'open') ? '▾' : '▸';
-            updateCloudMini();
-        }
-        function setCloudState(st) { localStorage.setItem(CLOUD_STATE_KEY, st); applyCloudState(); }
-        function toggleCloudBody() {
-            const st = localStorage.getItem(CLOUD_STATE_KEY) || (cloudBin ? 'min' : 'open');
-            setCloudState(st === 'open' ? 'min' : 'open');
-        }
-
-        // Gestion / suppression
-        let manageCat = null;
-        function openManage(cat) {
-            manageCat = cat;
-            document.getElementById('main-interface').style.display = 'none';
-            document.getElementById('manage-ui').style.display = 'block';
-            document.getElementById('manage-title').innerText = '⚙️ ' + cat;
-            renderManage();
-            window.scrollTo(0, 0);
-        }
-
-        function renderManage() {
-            const list = document.getElementById('manage-list');
-            list.innerHTML = '';
-            const cards = Object.values(deckData).filter(c => c.cat === manageCat);
-            if (!cards.length) { backToMain(); renderCourseGrid(); return; }
-            cards.forEach(c => {
-                const row = document.createElement('div'); row.className = 'manage-row';
-                const txt = document.createElement('div'); txt.className = 'txt';
-                const q = document.createElement('div'); q.style.fontWeight = 'bold'; q.textContent = c.q;
-                const a = document.createElement('div'); a.style.cssText = 'font-size:0.85em;color:#64748b;'; a.textContent = '→ ' + c.a;
-                const sel = document.createElement('select'); sel.className = 'manage-type';
-                Object.keys(TYPES).forEach(t => { const o = document.createElement('option'); o.value = t; o.textContent = TYPES[t].icon + ' ' + TYPES[t].label; sel.appendChild(o); });
-                sel.value = cardType(c);
-                sel.onchange = () => { c.type = sel.value; saveData(); renderTypePicker(); };
-                txt.appendChild(q); txt.appendChild(a); txt.appendChild(sel);
-                const del = document.createElement('button'); del.className = 'manage-del'; del.textContent = '🗑';
-                del.setAttribute('aria-label', 'Supprimer cette question');
-                del.onclick = () => {
-                    if (!confirm('Supprimer cette question ?')) return;
-                    delete deckData[c.id]; saveData(); renderManage(); renderCourseGrid();
-                };
-                row.appendChild(txt); row.appendChild(del); list.appendChild(row);
-            });
-            if (window.MathJax && MathJax.typesetPromise) MathJax.typesetPromise([list]);
-        }
-
-        function deleteChapter() {
-            const ids = Object.values(deckData).filter(c => c.cat === manageCat).map(c => c.id);
-            if (!confirm('Supprimer définitivement les ' + ids.length + ' questions du chapitre « ' + manageCat + ' » ?')) return;
-            ids.forEach(id => delete deckData[id]);
-            saveData(); backToMain(); renderCourseGrid();
-        }
-
-        // Mode Cours (lecture seule, n'affecte pas la progression)
-        let courseCat = null;
-
-        function onModeChange(silent) {
-            const m = document.getElementById('study-mode-toggle').value;
-            if (!silent) localStorage.setItem('pcsi_mode', m);
-            document.getElementById('btn-start').innerText = (m === 'course') ? '📖 Ouvrir tout le cours' : '🚀 Lancer les révisions du jour';
-        }
-
-        function openCourse(cat) {
-            courseCat = cat;
-            if (Object.keys(deckData).length === 0) return alert("Aucun contenu pour le moment : importe d'abord des cartes.");
-            document.getElementById('main-interface').style.display = 'none';
-            document.getElementById('course-ui').style.display = 'block';
-            document.getElementById('course-title').innerText = '📖 ' + (cat || 'Cours (chapitres sélectionnés)') + typeSuffix();
-            document.getElementById('course-search').value = '';
-            renderCourse();
-            window.scrollTo(0, 0);
-        }
-
-        function renderCourse() {
-            const box = document.getElementById('course-content');
-            const q = document.getElementById('course-search').value.trim().toLowerCase();
-            box.innerHTML = '';
-            let cards = Object.values(deckData).filter(c => (courseCat ? c.cat === courseCat : isChapterSelected(c.cat)) && matchType(c));
-            if (q) cards = cards.filter(c => [c.q, c.a, c.expl, c.cat].join(' ').toLowerCase().includes(q));
-            if (cards.length === 0) { box.innerHTML = "<p style='color:#64748b;'>Aucun résultat (vérifie le filtre de type de contenu).</p>"; return; }
-
-            let groups = {};
-            cards.forEach(c => { (groups[c.cat] = groups[c.cat] || []).push(c); });
-            Object.keys(groups).sort().forEach(cat => {
-                if (!courseCat) {
-                    const h = document.createElement('h3');
-                    h.className = 'course-chap';
-                    h.textContent = cat + ' (' + groups[cat].length + ')';
-                    box.appendChild(h);
-                }
-                groups[cat].forEach(c => {
-                    const item = document.createElement('div'); item.className = 'course-item';
-                    const topic = document.createElement('div'); topic.className = 'course-topic'; topic.textContent = c.q;
-                    const key = document.createElement('div'); key.className = 'course-key'; key.textContent = c.a;
-                    item.appendChild(tbadge(c)); item.appendChild(topic); item.appendChild(key);
-                    if (c.expl) {
-                        const ex = document.createElement('div'); ex.className = 'course-expl';
-                        ex.textContent = '💡 ' + c.expl;
-                        item.appendChild(ex);
-                    }
-                    box.appendChild(item);
-                });
-            });
-            if (window.MathJax && MathJax.typesetPromise) MathJax.typesetPromise([box]);
-        }
-
-        // Moteur de révision
-        function startSession(mode, category) {
-            if (document.getElementById('study-mode-toggle').value === 'course')
-                return openCourse(mode === 'specific' ? category : null);
-            isQCMMode = document.getElementById('study-mode-toggle').value === 'qcm';
-            let now = Date.now();
-            let allCards = Object.values(deckData);
-
-            if (mode === 'due') currentSession = allCards.filter(c => c.nextReview <= now && isChapterSelected(c.cat) && matchType(c));
-            else if (mode === 'specific') currentSession = allCards.filter(c => c.cat === category && matchType(c));
-            else currentSession = allCards.filter(c => isChapterSelected(c.cat) && matchType(c));
-
-            currentSession.sort(() => Math.random() - 0.5);
-
-            if (currentSession.length === 0) return alert("Rien à réviser avec ces filtres (chapitres / type de contenu) pour le moment !");
-            
-            currentIndex = 0;
-            document.getElementById('main-interface').style.display = 'none';
-            document.getElementById('study-ui').style.display = 'block';
-            
-            document.getElementById('scratchpad-wrapper').style.display = 'none';
-            clearCanvas();
-            document.getElementById('cloud-save-indicator').innerText = "";
-
-            showCard();
-        }
-
-        function shuffleArray(arr) {
-            return arr.sort(() => Math.random() - 0.5);
-        }
-
-        function showCard() {
-            if (currentIndex >= currentSession.length) return endSession();
-
-            let card = currentSession[currentIndex];
-            document.getElementById('card-category').innerText = card.cat + ' · ' + TYPES[cardType(card)].icon + ' ' + TYPES[cardType(card)].label;
-            document.getElementById('question-text').innerText = card.q;
-            document.getElementById('answer-text').innerText = card.a;
-            
-            let explBox = document.getElementById('mini-cours');
-            if(card.expl) { explBox.style.display = 'block'; document.getElementById('expl-text').innerText = card.expl; } 
-            else { explBox.style.display = 'none'; }
-            
-            document.getElementById('card-badge').innerText = card.reviews === 0 ? "NOUVELLE" : `RÉVISION`;
-            document.getElementById('card-badge').className = card.reviews === 0 ? "badge badge-new" : "badge badge-review";
-
-            document.getElementById('answer-box').style.display = 'none';
-            document.getElementById('flashcard-eval-zone').style.display = 'none';
-            document.getElementById('btn-next-qcm').style.display = 'none';
-
-            let hasDistractors = card.d1 && card.d1.trim() !== "";
-            
-            if (isQCMMode && hasDistractors) {
-                document.getElementById('btn-show-answer').style.display = 'none';
-                let qcmBox = document.getElementById('qcm-box');
-                qcmBox.style.display = 'flex';
-                qcmBox.innerHTML = '';
-                
-                let options = shuffleArray([card.a, card.d1, card.d2, card.d3].filter(x => x && x.trim()!==""));
-                options.forEach(opt => {
-                    let btn = document.createElement('button');
-                    btn.className = "qcm-btn";
-                    btn.innerText = opt;
-                    btn.dataset.correct = (opt === card.a) ? "true" : "false";
-                    btn.onclick = () => handleQCMClick(btn);
-                    qcmBox.appendChild(btn);
-                });
-            } else {
-                document.getElementById('qcm-box').style.display = 'none';
-                document.getElementById('btn-show-answer').style.display = 'block';
-                document.getElementById('flashcard-eval-zone').style.display = 'block';
-            }
-
-            if(window.MathJax) MathJax.typesetPromise();
-        }
-
-        function handleQCMClick(clickedBtn) {
-            let allBtns = document.querySelectorAll('.qcm-btn');
-            allBtns.forEach(b => b.disabled = true);
-            
-            if (clickedBtn.dataset.correct === "true") {
-                clickedBtn.classList.add('correct');
-                currentQCMScore = 3; 
-            } else {
-                clickedBtn.classList.add('wrong');
-                allBtns.forEach(b => { if(b.dataset.correct === "true") b.classList.add('correct'); });
-                currentQCMScore = 0; 
-            }
-            
-            document.getElementById('answer-box').style.display = 'block';
-            document.getElementById('btn-next-qcm').style.display = 'block';
-        }
-
-        function nextQCMCard() {
-            evalCard(currentQCMScore);
-        }
-
-        function showAnswer() {
-            document.getElementById('btn-show-answer').style.display = 'none';
-            document.getElementById('answer-box').style.display = 'block';
-        }
-
-        function evalCard(quality) {
-            let card = deckData[currentSession[currentIndex].id];
-            card.reviews++;
-
-            if (quality === 0) { card.interval = 0; card.failures++; } 
-            else {
-                card.successes++;
-                if (card.interval === 0) card.interval = 1;
-                else if (card.interval === 1) card.interval = 3;
-                else card.interval = Math.round(card.interval * 1.5);
-            }
-
-            card.nextReview = Date.now() + (card.interval * 24 * 60 * 60 * 1000);
-            
-            saveData();
-            
-            clearCanvas();
-            currentIndex++;
-            showCard();
-        }
-
-        function endSession() {
-            backToMain();
-        }
-
-        // ==========================================
-        // GESTION DU BROUILLON
-        // ==========================================
-        const canvas = document.getElementById('brouillon-canvas');
-        const ctx = canvas.getContext('2d');
-        let isDrawing = false;
-        let currentTool = 'pen';
-
-        function toggleScratchpad() {
-            const wrapper = document.getElementById('scratchpad-wrapper');
-            if (wrapper.style.display === 'none' || wrapper.style.display === '') {
-                wrapper.style.display = 'block';
-                canvas.width = wrapper.clientWidth;
-                canvas.height = 300;
-                clearCanvas();
-            } else {
-                wrapper.style.display = 'none';
-            }
-        }
-
-        function setTool(tool) {
-            currentTool = tool;
-            document.getElementById('tool-pen').classList.remove('active-tool');
-            document.getElementById('tool-eraser').classList.remove('active-tool');
-            document.getElementById('tool-' + tool).classList.add('active-tool');
-        }
-
-        function clearCanvas() {
-            ctx.fillStyle = "#ffffff";
-            ctx.fillRect(0, 0, canvas.width, canvas.height);
-        }
-
-        function getPos(e) {
-            let rect = canvas.getBoundingClientRect();
-            let clientX = e.clientX;
-            let clientY = e.clientY;
-            if(e.touches && e.touches.length > 0) {
-                clientX = e.touches[0].clientX;
-                clientY = e.touches[0].clientY;
-            }
-            return { x: clientX - rect.left, y: clientY - rect.top };
-        }
-
-        function startPosition(e) {
-            isDrawing = true;
-            draw(e);
-        }
-
-        function endPosition() {
-            isDrawing = false;
-            ctx.beginPath();
-        }
-
-        function draw(e) {
-            if (!isDrawing) return;
-            e.preventDefault(); 
-            let pos = getPos(e);
-            
-            ctx.lineWidth = currentTool === 'eraser' ? 25 : 3;
-            ctx.lineCap = 'round';
-            ctx.strokeStyle = currentTool === 'eraser' ? '#ffffff' : '#0f172a';
-            
-            ctx.lineTo(pos.x, pos.y);
-            ctx.stroke();
-            ctx.beginPath();
-            ctx.moveTo(pos.x, pos.y);
-        }
-
-        function initCanvas() {
-            canvas.addEventListener('mousedown', startPosition);
-            canvas.addEventListener('mouseup', endPosition);
-            canvas.addEventListener('mousemove', draw);
-            canvas.addEventListener('mouseout', endPosition);
-            canvas.addEventListener('touchstart', startPosition, {passive: false});
-            canvas.addEventListener('touchend', endPosition);
-            canvas.addEventListener('touchmove', draw, {passive: false});
-        }
-
-        initApp();
-    </script>
-</body>
-</html>);
-                    if (ch === '\\' && next === '(' && !mathMode) { mathMode = 'paren'; protectedLine += ch + next; i++; escaped = false; continue; }
-                    if (ch === '\\' && next === ')' && mathMode === 'paren') { mathMode = null; protectedLine += ch + next; i++; escaped = false; continue; }
-                    if (ch === '|' && mathMode) protectedLine += barToken;
-                    else protectedLine += ch;
-                    escaped = ch === '\\' && !escaped;
-                    if (ch !== '\\') escaped = false;
-                }
-                let parts = protectedLine.split('|').map(p => cleanText(p.replaceAll(barToken, '|').trim()));
-                if(parts.length >= 3) {
-                    let newCard = {
-                        id: generateId(),
-                        cat: parts[0], q: parts[1], a: parts[2],
-                        expl: parts[3] || "",
-                        d1: parts[4] || "", d2: parts[5] || "", d3: parts[6] || "",
-                        type: normType(parts[7]),
-                        interval: 0, nextReview: Date.now(), reviews: 0, successes: 0, failures: 0
-                    };
-                    deckData[newCard.id] = newCard;
-                    added++;
-                }
-            });
-            if(added > 0) {
-                saveData(); 
-                document.getElementById('bulk-text').value = "";
-                alert(`${added} cartes importées avec succès !`);
-                updateDashboard();
-            }
-        }
-
-        // Dashboard
-        function updateDashboard() {
-            let due = 0, nev = 0;
-            let now = Date.now();
-            let dueByChap = {};
-
-            Object.values(deckData).forEach(c => {
-                if(!dueByChap[c.cat]) dueByChap[c.cat] = 0;
-                if (c.reviews === 0 && c.interval === 0) nev++;
-                if (c.nextReview <= now || (c.reviews === 0 && c.interval === 0)) {
-                    due++;
-                    dueByChap[c.cat]++;
-                }
-            });
-            
-            document.getElementById('stat-due').innerText = due;
-            document.getElementById('stat-new').innerText = nev;
-
-            let chapListHTML = '';
-            let sortedChaps = Object.keys(dueByChap).sort();
-            sortedChaps.forEach(chap => {
-                if(dueByChap[chap] > 0) {
-                    chapListHTML += `<div class="list-item"><span>${chap}</span> <span class="score-badge score-bad">${dueByChap[chap]} à revoir</span></div>`;
-                }
-            });
-            document.getElementById('due-by-chapter-list').innerHTML = chapListHTML || "<p style='color:#10b981; font-weight:bold;'>Tout est à jour, bravo ! 🎉</p>";
-            renderChapterPicker();
-        }
-
-        function renderCourseGrid() {
-            const grid = document.getElementById('course-grid');
-            grid.innerHTML = "";
-            let tot = {}, match = {};
-            Object.values(deckData).forEach(c => { tot[c.cat] = (tot[c.cat] || 0) + 1; if (matchType(c)) match[c.cat] = (match[c.cat] || 0) + 1; });
-            const filtered = getTypeFilter().size > 0;
-            Object.keys(tot).sort().forEach(cat => {
-                let div = document.createElement('div');
-                div.className = "course-card";
-                div.onclick = () => startSession('specific', cat);
-                div.innerHTML = `<div class="course-title"></div><div style="font-size:0.85em;color:#64748b;"></div>`;
-                div.querySelector('.course-title').textContent = cat;
-                div.lastChild.textContent = filtered ? `${match[cat] || 0} / ${tot[cat]} cartes` : `${tot[cat]} cartes`;
-                const mb = document.createElement('button');
-                mb.className = 'course-manage';
-                mb.textContent = '⚙️ Gérer / supprimer';
-                mb.onclick = (e) => { e.stopPropagation(); openManage(cat); };
-                div.appendChild(mb);
-                grid.appendChild(div);
-            });
-            renderTypePicker();
-        }
-
-        // Sélection des chapitres à réviser (on mémorise les chapitres exclus)
-        const EXCL_KEY = 'pcsi_chap_excl';
-        function getExcluded() { try { return new Set(JSON.parse(localStorage.getItem(EXCL_KEY)) || []); } catch(e) { return new Set(); } }
-        function isChapterSelected(cat) { return !getExcluded().has(cat); }
-
-        // ----- Types de contenu (définition / proposition / méthode) -----
-        const TYPES = {
-            def:   { label:'Définition',  plural:'Définitions',  icon:'📘' },
-            prop:  { label:'Proposition', plural:'Propositions', icon:'📐' },
-            meth:  { label:'Méthode',     plural:'Méthodes',     icon:'🛠️' },
-            autre: { label:'Autre',       plural:'Autres',       icon:'📝' }
-        };
-        const TYPE_KEY = 'pcsi_type_filter';
-        function guessType(c) { // détection approximative d'après la question
-            const q = (c.q || '');
-            if (/m[ée]thode|comment\s+(?!s'appelle|note|d[ée]finit|appelle)|proc[ée]d(er|ure)|technique|algorithme|strat[ée]gie|[ée]tapes?\b|astuce|r[ée]flexe|que (faire|fait-on)|pour (calculer|d[ée]montrer|montrer|prouver|r[ée]soudre|d[ée]terminer|[ée]tudier|trouver)/i.test(q)) return 'meth';
-            if (/d[ée]finition|d[ée]finir|d[ée]fini(t|e)\b|qu'appelle|on appelle|qu'est-ce qu|que signifie|que veut dire|notion de|d[ée]signe|se note|notation/i.test(q)) return 'def';
-            if (/proposition|th[ée]or[èe]me|lemme|corollaire|propri[ée]t[ée]|[ée]nonc|formule|in[ée]galit[ée]|crit[èe]re|caract[ée]ris|r[èe]gle|condition (n[ée]cessaire|suffisante)|relation|identit[ée]|d[ée]veloppement limit/i.test(q)) return 'prop';
-            return 'autre';
-        }
-        function cardType(c) { return TYPES[c.type] ? c.type : guessType(c); }
-        function normType(t) {
-            if (!t) return undefined;
-            if (/d[ée]f/i.test(t)) return 'def';
-            if (/m[ée]th/i.test(t)) return 'meth';
-            if (/prop|th[ée]or|lemme|corol|propri/i.test(t)) return 'prop';
-            if (/autre/i.test(t)) return 'autre';
-            return undefined;
-        }
-        function getTypeFilter() { try { return new Set(JSON.parse(localStorage.getItem(TYPE_KEY)) || []); } catch(e) { return new Set(); } }
-        function matchType(c) { const f = getTypeFilter(); return f.size === 0 || f.has(cardType(c)); }
-        function typeSuffix() { const f = [...getTypeFilter()]; return f.length ? ' · ' + f.map(t => TYPES[t].plural).join(', ') : ''; }
-        function tbadge(c) { const t = TYPES[cardType(c)]; const b = document.createElement('div'); b.className = 'tbadge'; b.textContent = t.icon + ' ' + t.label; return b; }
-
-        function makeChip(label, on, fn, count) {
-            const b = document.createElement('button'); b.type = 'button';
-            b.className = 'chip' + (on ? ' on' : ''); b.textContent = label;
-            if (count != null) { const sm = document.createElement('small'); sm.textContent = count; b.appendChild(sm); }
-            b.onclick = fn; return b;
-        }
-
-        function renderTypePicker() {
-            const f = getTypeFilter();
-            const counts = { def:0, prop:0, meth:0, autre:0 };
-            Object.values(deckData).forEach(c => counts[cardType(c)]++);
-            const save = (set) => {
-                if (set.size === Object.keys(TYPES).length) set.clear();
-                localStorage.setItem(TYPE_KEY, JSON.stringify([...set]));
-                renderTypePicker(); if (document.getElementById('tab-courses').classList.contains('active')) renderCourseGrid();
-            };
-            document.querySelectorAll('.type-chips').forEach(box => {
-                box.innerHTML = '';
-                box.appendChild(makeChip('Tout', f.size === 0, () => save(new Set())));
-                Object.keys(TYPES).forEach(t => box.appendChild(makeChip(TYPES[t].icon + ' ' + TYPES[t].plural, f.has(t), () => {
-                    const n = getTypeFilter(); if (n.has(t)) n.delete(t); else n.add(t); save(n);
-                }, counts[t])));
-            });
-            document.querySelectorAll('.type-sub').forEach(e => e.innerText = f.size ? 'filtre actif' : 'tous');
-        }
-
-        // ----- Chapitres : chips (« Tout » actif = aucun filtre ; un clic sélectionne seulement ce chapitre) -----
-        function renderChapterPicker() {
-            const list = document.getElementById('chap-picker-list');
-            const excl = getExcluded();
-            const counts = {};
-            Object.values(deckData).forEach(c => { counts[c.cat] = (counts[c.cat] || 0) + 1; });
-            const cats = Object.keys(counts).sort();
-            const allOn = cats.every(c => !excl.has(c));
-            const store = (e) => { localStorage.setItem(EXCL_KEY, JSON.stringify([...e])); renderChapterPicker(); };
-            list.innerHTML = '';
-            if (!cats.length) list.innerHTML = "<span style='color:#64748b; font-size:0.9em;'>Aucun chapitre pour le moment.</span>";
-            else list.appendChild(makeChip('Tout', allOn, () => store(new Set())));
-            cats.forEach(cat => list.appendChild(makeChip(cat, !allOn && !excl.has(cat), () => {
-                const e = getExcluded();
-                if (cats.every(c => !e.has(c))) cats.forEach(c => { if (c !== cat) e.add(c); }); // tout actif -> seulement celui-ci
-                else { if (e.has(cat)) e.delete(cat); else e.add(cat); if (cats.every(c => e.has(c))) e.clear(); }
-                store(e);
-            }, counts[cat])));
-            document.getElementById('chap-picker-title').innerText = allOn ? 'tous' : cats.filter(c => !excl.has(c)).length + ' sur ' + cats.length;
-            renderTypePicker();
-        }
-
-        function setAllChapters(on) {
-            localStorage.setItem(EXCL_KEY, JSON.stringify(on ? [] : [...new Set(Object.values(deckData).map(c => c.cat))]));
-            renderChapterPicker();
-        }
-
-        // ----- Thème & zone cloud -----
-        function updateThemeBtn() {
-            const dark = document.documentElement.classList.contains('dark');
-            const b = document.getElementById('theme-btn'); if (b) b.innerText = dark ? '☀️' : '🌙';
-            const m = document.querySelector('meta[name=theme-color]'); if (m) m.content = dark ? '#0b1220' : '#2563eb';
-        }
-        function toggleTheme() {
-            const dark = document.documentElement.classList.toggle('dark');
-            localStorage.setItem('pcsi_theme', dark ? 'dark' : 'light');
-            updateThemeBtn();
-        }
-        const CLOUD_STATE_KEY = 'pcsi_cloud_state';
-        function updateCloudMini() {
-            const e = document.getElementById('cloud-mini-status');
-            if (e) e.innerText = cloudBin ? '✅ Synchronisation active' : 'Non configurée';
-        }
-        function applyCloudState() {
-            const st = localStorage.getItem(CLOUD_STATE_KEY) || (cloudBin ? 'min' : 'open');
-            document.getElementById('cloud-setup').style.display = (st === 'hidden') ? 'none' : 'block';
-            document.getElementById('cloud-restore').style.display = (st === 'hidden') ? 'block' : 'none';
-            document.getElementById('cloud-body').style.display = (st === 'open') ? 'block' : 'none';
-            document.getElementById('cloud-toggle').innerText = (st === 'open') ? '▾' : '▸';
-            updateCloudMini();
-        }
-        function setCloudState(st) { localStorage.setItem(CLOUD_STATE_KEY, st); applyCloudState(); }
-        function toggleCloudBody() {
-            const st = localStorage.getItem(CLOUD_STATE_KEY) || (cloudBin ? 'min' : 'open');
-            setCloudState(st === 'open' ? 'min' : 'open');
-        }
-
-        // Gestion / suppression
-        let manageCat = null;
-        function openManage(cat) {
-            manageCat = cat;
-            document.getElementById('main-interface').style.display = 'none';
-            document.getElementById('manage-ui').style.display = 'block';
-            document.getElementById('manage-title').innerText = '⚙️ ' + cat;
-            renderManage();
-            window.scrollTo(0, 0);
-        }
-
-        function renderManage() {
-            const list = document.getElementById('manage-list');
-            list.innerHTML = '';
-            const cards = Object.values(deckData).filter(c => c.cat === manageCat);
-            if (!cards.length) { backToMain(); renderCourseGrid(); return; }
-            cards.forEach(c => {
-                const row = document.createElement('div'); row.className = 'manage-row';
-                const txt = document.createElement('div'); txt.className = 'txt';
-                const q = document.createElement('div'); q.style.fontWeight = 'bold'; q.textContent = c.q;
-                const a = document.createElement('div'); a.style.cssText = 'font-size:0.85em;color:#64748b;'; a.textContent = '→ ' + c.a;
-                const sel = document.createElement('select'); sel.className = 'manage-type';
-                Object.keys(TYPES).forEach(t => { const o = document.createElement('option'); o.value = t; o.textContent = TYPES[t].icon + ' ' + TYPES[t].label; sel.appendChild(o); });
-                sel.value = cardType(c);
-                sel.onchange = () => { c.type = sel.value; saveData(); renderTypePicker(); };
-                txt.appendChild(q); txt.appendChild(a); txt.appendChild(sel);
-                const del = document.createElement('button'); del.className = 'manage-del'; del.textContent = '🗑';
-                del.setAttribute('aria-label', 'Supprimer cette question');
-                del.onclick = () => {
-                    if (!confirm('Supprimer cette question ?')) return;
-                    delete deckData[c.id]; saveData(); renderManage(); renderCourseGrid();
-                };
-                row.appendChild(txt); row.appendChild(del); list.appendChild(row);
-            });
-            if (window.MathJax && MathJax.typesetPromise) MathJax.typesetPromise([list]);
-        }
-
-        function deleteChapter() {
-            const ids = Object.values(deckData).filter(c => c.cat === manageCat).map(c => c.id);
-            if (!confirm('Supprimer définitivement les ' + ids.length + ' questions du chapitre « ' + manageCat + ' » ?')) return;
-            ids.forEach(id => delete deckData[id]);
-            saveData(); backToMain(); renderCourseGrid();
-        }
-
-        // Mode Cours (lecture seule, n'affecte pas la progression)
-        let courseCat = null;
-
-        function onModeChange(silent) {
-            const m = document.getElementById('study-mode-toggle').value;
-            if (!silent) localStorage.setItem('pcsi_mode', m);
-            document.getElementById('btn-start').innerText = (m === 'course') ? '📖 Ouvrir tout le cours' : '🚀 Lancer les révisions du jour';
-        }
-
-        function openCourse(cat) {
-            courseCat = cat;
-            if (Object.keys(deckData).length === 0) return alert("Aucun contenu pour le moment : importe d'abord des cartes.");
-            document.getElementById('main-interface').style.display = 'none';
-            document.getElementById('course-ui').style.display = 'block';
-            document.getElementById('course-title').innerText = '📖 ' + (cat || 'Cours (chapitres sélectionnés)') + typeSuffix();
-            document.getElementById('course-search').value = '';
-            renderCourse();
-            window.scrollTo(0, 0);
-        }
-
-        function renderCourse() {
-            const box = document.getElementById('course-content');
-            const q = document.getElementById('course-search').value.trim().toLowerCase();
-            box.innerHTML = '';
-            let cards = Object.values(deckData).filter(c => (courseCat ? c.cat === courseCat : isChapterSelected(c.cat)) && matchType(c));
-            if (q) cards = cards.filter(c => [c.q, c.a, c.expl, c.cat].join(' ').toLowerCase().includes(q));
-            if (cards.length === 0) { box.innerHTML = "<p style='color:#64748b;'>Aucun résultat (vérifie le filtre de type de contenu).</p>"; return; }
-
-            let groups = {};
-            cards.forEach(c => { (groups[c.cat] = groups[c.cat] || []).push(c); });
-            Object.keys(groups).sort().forEach(cat => {
-                if (!courseCat) {
-                    const h = document.createElement('h3');
-                    h.className = 'course-chap';
-                    h.textContent = cat + ' (' + groups[cat].length + ')';
-                    box.appendChild(h);
-                }
-                groups[cat].forEach(c => {
-                    const item = document.createElement('div'); item.className = 'course-item';
-                    const topic = document.createElement('div'); topic.className = 'course-topic'; topic.textContent = c.q;
-                    const key = document.createElement('div'); key.className = 'course-key'; key.textContent = c.a;
-                    item.appendChild(tbadge(c)); item.appendChild(topic); item.appendChild(key);
-                    if (c.expl) {
-                        const ex = document.createElement('div'); ex.className = 'course-expl';
-                        ex.textContent = '💡 ' + c.expl;
-                        item.appendChild(ex);
-                    }
-                    box.appendChild(item);
-                });
-            });
-            if (window.MathJax && MathJax.typesetPromise) MathJax.typesetPromise([box]);
-        }
-
-        // Moteur de révision
-        function startSession(mode, category) {
-            if (document.getElementById('study-mode-toggle').value === 'course')
-                return openCourse(mode === 'specific' ? category : null);
-            isQCMMode = document.getElementById('study-mode-toggle').value === 'qcm';
-            let now = Date.now();
-            let allCards = Object.values(deckData);
-
-            if (mode === 'due') currentSession = allCards.filter(c => c.nextReview <= now && isChapterSelected(c.cat) && matchType(c));
-            else if (mode === 'specific') currentSession = allCards.filter(c => c.cat === category && matchType(c));
-            else currentSession = allCards.filter(c => isChapterSelected(c.cat) && matchType(c));
-
-            currentSession.sort(() => Math.random() - 0.5);
-
-            if (currentSession.length === 0) return alert("Rien à réviser avec ces filtres (chapitres / type de contenu) pour le moment !");
-            
-            currentIndex = 0;
-            document.getElementById('main-interface').style.display = 'none';
-            document.getElementById('study-ui').style.display = 'block';
-            
-            document.getElementById('scratchpad-wrapper').style.display = 'none';
-            clearCanvas();
-            document.getElementById('cloud-save-indicator').innerText = "";
-
-            showCard();
-        }
-
-        function shuffleArray(arr) {
-            return arr.sort(() => Math.random() - 0.5);
-        }
-
-        function showCard() {
-            if (currentIndex >= currentSession.length) return endSession();
-
-            let card = currentSession[currentIndex];
-            document.getElementById('card-category').innerText = card.cat + ' · ' + TYPES[cardType(card)].icon + ' ' + TYPES[cardType(card)].label;
-            document.getElementById('question-text').innerText = card.q;
-            document.getElementById('answer-text').innerText = card.a;
-            
-            let explBox = document.getElementById('mini-cours');
-            if(card.expl) { explBox.style.display = 'block'; document.getElementById('expl-text').innerText = card.expl; } 
-            else { explBox.style.display = 'none'; }
-            
-            document.getElementById('card-badge').innerText = card.reviews === 0 ? "NOUVELLE" : `RÉVISION`;
-            document.getElementById('card-badge').className = card.reviews === 0 ? "badge badge-new" : "badge badge-review";
-
-            document.getElementById('answer-box').style.display = 'none';
-            document.getElementById('flashcard-eval-zone').style.display = 'none';
-            document.getElementById('btn-next-qcm').style.display = 'none';
-
-            let hasDistractors = card.d1 && card.d1.trim() !== "";
-            
-            if (isQCMMode && hasDistractors) {
-                document.getElementById('btn-show-answer').style.display = 'none';
-                let qcmBox = document.getElementById('qcm-box');
-                qcmBox.style.display = 'flex';
-                qcmBox.innerHTML = '';
-                
-                let options = shuffleArray([card.a, card.d1, card.d2, card.d3].filter(x => x && x.trim()!==""));
-                options.forEach(opt => {
-                    let btn = document.createElement('button');
-                    btn.className = "qcm-btn";
-                    btn.innerText = opt;
-                    btn.dataset.correct = (opt === card.a) ? "true" : "false";
-                    btn.onclick = () => handleQCMClick(btn);
-                    qcmBox.appendChild(btn);
-                });
-            } else {
-                document.getElementById('qcm-box').style.display = 'none';
-                document.getElementById('btn-show-answer').style.display = 'block';
-                document.getElementById('flashcard-eval-zone').style.display = 'block';
-            }
-
-            if(window.MathJax) MathJax.typesetPromise();
-        }
-
-        function handleQCMClick(clickedBtn) {
-            let allBtns = document.querySelectorAll('.qcm-btn');
-            allBtns.forEach(b => b.disabled = true);
-            
-            if (clickedBtn.dataset.correct === "true") {
-                clickedBtn.classList.add('correct');
-                currentQCMScore = 3; 
-            } else {
-                clickedBtn.classList.add('wrong');
-                allBtns.forEach(b => { if(b.dataset.correct === "true") b.classList.add('correct'); });
-                currentQCMScore = 0; 
-            }
-            
-            document.getElementById('answer-box').style.display = 'block';
-            document.getElementById('btn-next-qcm').style.display = 'block';
-        }
-
-        function nextQCMCard() {
-            evalCard(currentQCMScore);
-        }
-
-        function showAnswer() {
-            document.getElementById('btn-show-answer').style.display = 'none';
-            document.getElementById('answer-box').style.display = 'block';
-        }
-
-        function evalCard(quality) {
-            let card = deckData[currentSession[currentIndex].id];
-            card.reviews++;
-
-            if (quality === 0) { card.interval = 0; card.failures++; } 
-            else {
-                card.successes++;
-                if (card.interval === 0) card.interval = 1;
-                else if (card.interval === 1) card.interval = 3;
-                else card.interval = Math.round(card.interval * 1.5);
-            }
-
-            card.nextReview = Date.now() + (card.interval * 24 * 60 * 60 * 1000);
-            
-            saveData();
-            
-            clearCanvas();
-            currentIndex++;
-            showCard();
-        }
-
-        function endSession() {
-            backToMain();
-        }
-
-        // ==========================================
-        // GESTION DU BROUILLON
-        // ==========================================
-        const canvas = document.getElementById('brouillon-canvas');
-        const ctx = canvas.getContext('2d');
-        let isDrawing = false;
-        let currentTool = 'pen';
-
-        function toggleScratchpad() {
-            const wrapper = document.getElementById('scratchpad-wrapper');
-            if (wrapper.style.display === 'none' || wrapper.style.display === '') {
-                wrapper.style.display = 'block';
-                canvas.width = wrapper.clientWidth;
-                canvas.height = 300;
-                clearCanvas();
-            } else {
-                wrapper.style.display = 'none';
-            }
-        }
-
-        function setTool(tool) {
-            currentTool = tool;
-            document.getElementById('tool-pen').classList.remove('active-tool');
-            document.getElementById('tool-eraser').classList.remove('active-tool');
-            document.getElementById('tool-' + tool).classList.add('active-tool');
-        }
-
-        function clearCanvas() {
-            ctx.fillStyle = "#ffffff";
-            ctx.fillRect(0, 0, canvas.width, canvas.height);
-        }
-
-        function getPos(e) {
-            let rect = canvas.getBoundingClientRect();
-            let clientX = e.clientX;
-            let clientY = e.clientY;
-            if(e.touches && e.touches.length > 0) {
-                clientX = e.touches[0].clientX;
-                clientY = e.touches[0].clientY;
-            }
-            return { x: clientX - rect.left, y: clientY - rect.top };
-        }
-
-        function startPosition(e) {
-            isDrawing = true;
-            draw(e);
-        }
-
-        function endPosition() {
-            isDrawing = false;
-            ctx.beginPath();
-        }
-
-        function draw(e) {
-            if (!isDrawing) return;
-            e.preventDefault(); 
-            let pos = getPos(e);
-            
-            ctx.lineWidth = currentTool === 'eraser' ? 25 : 3;
-            ctx.lineCap = 'round';
-            ctx.strokeStyle = currentTool === 'eraser' ? '#ffffff' : '#0f172a';
-            
-            ctx.lineTo(pos.x, pos.y);
-            ctx.stroke();
-            ctx.beginPath();
-            ctx.moveTo(pos.x, pos.y);
-        }
-
-        function initCanvas() {
-            canvas.addEventListener('mousedown', startPosition);
-            canvas.addEventListener('mouseup', endPosition);
-            canvas.addEventListener('mousemove', draw);
-            canvas.addEventListener('mouseout', endPosition);
-            canvas.addEventListener('touchstart', startPosition, {passive: false});
-            canvas.addEventListener('touchend', endPosition);
-            canvas.addEventListener('touchmove', draw, {passive: false});
         }
 
         initApp();
