@@ -689,10 +689,9 @@
         function cleanDeck() {
             let n = 0;
             Object.values(deckData).forEach(c => {
-                if (repairCardLaTeX(c)) n++;
-
                 // Réparation ciblée de l'ancien import à 7 champs :
                 // pour ce chapitre uniquement, le type avait été placé dans d3.
+                // On la fait avant la réparation LaTeX pour ne pas absorber le type dans une formule.
                 if ((c.cat || '').trim() === 'Suites et séries de fonctions' && typeof c.d3 === 'string') {
                     const importedType = normType(c.d3);
                     if (importedType) {
@@ -701,6 +700,8 @@
                         n++;
                     }
                 }
+
+                if (repairCardLaTeX(c)) n++;
 
                 ['cat','q','a','expl','d1','d2','d3'].forEach(k => {
                     if (typeof c[k] === 'string') {
