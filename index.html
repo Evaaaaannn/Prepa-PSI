@@ -635,9 +635,19 @@
             let added = 0;
             lines.forEach(line => {
                 if(line.trim() === '') return;
-                // Protège les barres verticales appartenant aux blocs $...$ et \\(...\\).
-                const barToken = '\uE000';
-                const protectedLine = line.replace(/(\$[^$]*\$|\\\\\([\\s\\S]*?\\\\\))/g, math => math.replace(/\\|/g, barToken));
+                // Protège les barres verticales dans $...$ et \\(...\\) avant le découpage.
+                const slash = String.fromCharCode(92), barToken = '\uE000';
+                let mathMode = null, escaped = false, protectedLine = '';
+                for (let i = 0; i < line.length; i++) {
+                    const ch = line[i], next = line[i + 1];
+                    if (ch === '$' && !escaped) mathMode = mathMode === '$' ? null : (mathMode || '$');
+                    if (ch === slash && next === '(' && !mathMode) { mathMode = 'paren'; protectedLine += ch + next; i++; escaped = false; continue; }
+                    if (ch === slash && next === ')' && mathMode === 'paren') { mathMode = null; protectedLine += ch + next; i++; escaped = false; continue; }
+                    if (ch === '|' && mathMode) protectedLine += barToken;
+                    else protectedLine += ch;
+                    escaped = ch === slash && !escaped;
+                    if (ch !== slash) escaped = false;
+                }
                 let parts = protectedLine.split('|').map(p => cleanText(p.replaceAll(barToken, '|').trim()));
                 if(parts.length >= 3) {
                     let newCard = {
