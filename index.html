@@ -587,12 +587,24 @@
 
         // Nettoyage des balises de citation laissées par l'IA.
         const CITE_RE = /([ \t]*)\[\s*cite(?:_start|_end)?\s*(?::[^\]]*)?\]/gi;
+        function repairLaTeX(t) {
+            if (typeof t !== 'string') return t;
+            // Les normes \|x\| sont parfois importées sans délimiteurs mathématiques.
+            return t.replace(/\\\|([^|\n]+)\\\|/g, (match, inner, offset, whole) => {
+                const before = whole.slice(0, offset);
+                const openDollar = (before.match(/(?<!\\)\$/g) || []).length % 2 === 1;
+                const openParen = before.lastIndexOf('\\(') > before.lastIndexOf('\\)');
+                return (openDollar || openParen) ? match : '$' + match + '$';
+            });
+        }
+
         function cleanText(t) {
             if (typeof t !== 'string') return t;
-            return t.replace(CITE_RE, (m, ws, off, str) => {
+            const cleaned = t.replace(CITE_RE, (m, ws, off, str) => {
                 const next = str[off + m.length];
                 return (next && /[\p{L}\p{N}]/u.test(next)) ? ws : '';
             }).trim();
+            return repairLaTeX(cleaned);
         }
 
         function hasUnclosedMath(value) {
@@ -641,18 +653,26 @@
 
         function repairCardLaTeX(card) {
             if (!card || typeof card !== 'object' || typeof card.a !== 'string') return false;
-            let answer = card.a;
-            if (!hasUnclosedMath(answer)) return false;
-
             const oldFields = [card.expl || '', card.d1 || '', card.d2 || '', card.d3 || ''];
-            let consumed = 0;
-            for (const fragment of oldFields) {
-                answer += (answer.endsWith('|') ? '' : '|') + fragment;
-                consumed++;
-                if (!hasUnclosedMath(answer)) break;
-            }
-            if (consumed === 0 || hasUnclosedMath(answer)) return false;
+            let answer = card.a, consumed = 0;
 
+            // Ancien bug d'import : la barre de norme a coupé la réponse en deux champs.
+            if (/\\\s*$/.test(answer) && /^y-x\\/.test(oldFields[0])) {
+                answer += '|' + oldFields[0];
+                consumed = 1;
+                if (oldFields[1] === '$' || oldFields[1] === '\\)') {
+                    answer += '|' + oldFields[1];
+                    consumed++;
+                }
+            } else if (hasUnclosedMath(answer)) {
+                for (const fragment of oldFields) {
+                    answer += (answer.endsWith('|') ? '' : '|') + fragment;
+                    consumed++;
+                    if (!hasUnclosedMath(answer)) break;
+                }
+            }
+
+            if (consumed === 0 || hasUnclosedMath(answer)) return false;
             const remaining = oldFields.slice(consumed);
             card.a = answer;
             card.expl = remaining[0] || '';
@@ -1185,11 +1205,14 @@
             if (mj && typeof mj.typesetClear === 'function' && element) mj.typesetClear([element]);
         }
 
+        // MathJax v3 demande de sérialiser les typesetPromise successifs.
+        let mathJaxQueue = Promise.resolve();
         function typesetMath(element) {
-            const mj = window.MathJax;
-            if (!mj || typeof mj.typesetPromise !== 'function') return;
-            mj.typesetPromise(element ? [element] : undefined)
-                .catch(error => console.error('Erreur MathJax :', error));
+            mathJaxQueue = mathJaxQueue.catch(() => {}).then(() => {
+                const mj = window.MathJax;
+                if (!mj || typeof mj.typesetPromise !== 'function') return;
+                return mj.typesetPromise(element ? [element] : undefined);
+            }).catch(error => console.error('Erreur MathJax :', error));
         }
 
         const mathJaxScript = document.getElementById('MathJax-script');
