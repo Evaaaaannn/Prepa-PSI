@@ -635,11 +635,10 @@
             let added = 0;
             lines.forEach(line => {
                 if(line.trim() === '') return;
-                // Protège les barres verticales situées dans les délimiteurs mathématiques.
-                let mathMode = null, escaped = false, protectedLine = '', barToken = '\uE000';
-                for (let i = 0; i < line.length; i++) {
-                    const ch = line[i], next = line[i + 1];
-                    if (ch === '
+                // Protège les barres verticales appartenant aux blocs $...$ et \\(...\\).
+                const barToken = '\uE000';
+                const protectedLine = line.replace(/(\$[^$]*\$|\\\\\([\\s\\S]*?\\\\\))/g, math => math.replace(/\\|/g, barToken));
+                let parts = protectedLine.split('|').map(p => cleanText(p.replaceAll(barToken, '|').trim()));
                 if(parts.length >= 3) {
                     let newCard = {
                         id: generateId(),
