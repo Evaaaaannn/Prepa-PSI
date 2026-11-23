@@ -280,7 +280,7 @@
             <h2>📥 Importer le cours de l'IA</h2>
             <div class="bulk-info">
                 Collez ici le bloc de texte généré par l'IA. <br>
-                Format attendu : <code>Chapitre | Question | Bonne Réponse | Mini-cours | Fausse 1 | Fausse 2 | Fausse 3 | Type</code><br><small>Type (facultatif) : <b>Définition</b>, <b>Proposition</b> ou <b>Méthode</b>. S'il est absent, l'appli le devine d'après la question ; tu peux le corriger dans « Gérer ».</small>
+                Formats acceptés : <code>Chapitre | Question | Réponse | Mini-cours | Fausse 1 | Fausse 2 | Type</code> ou avec <code>Fausse 3</code> avant le type.<br><small>Type (facultatif) : <b>Définition</b>, <b>Proposition</b> ou <b>Méthode</b>. S'il est absent, l'appli le devine d'après la question ; tu peux le corriger dans « Gérer ».</small>
             </div>
             <textarea id="bulk-text" class="form-control" style="min-height: 200px;" placeholder="Collez le code ici..."></textarea>
             <button class="btn btn-primary" onclick="addBulkCards()" style="margin-top: 10px;">Intégrer les nouvelles cartes</button>
@@ -704,28 +704,38 @@
             let text = document.getElementById('bulk-text').value.trim();
             if(!text) return;
             let lines = text.split('\n');
-            let added = 0;
+            let added = 0, skipped = 0;
             lines.forEach(line => {
                 if(line.trim() === '') return;
                 let parts = splitBulkLine(line);
-                if(parts.length >= 3) {
-                    let newCard = {
-                        id: generateId(),
-                        cat: parts[0], q: parts[1], a: parts[2],
-                        expl: parts[3] || "",
-                        d1: parts[4] || "", d2: parts[5] || "", d3: parts[6] || "",
-                        type: normType(parts[7]),
-                        interval: 0, nextReview: Date.now(), reviews: 0, successes: 0, failures: 0
-                    };
-                    deckData[newCard.id] = newCard;
-                    added++;
-                }
+                if(parts.length < 3) { skipped++; return; }
+
+                // Deux formats sont acceptés :
+                // 7 champs : Chapitre | Question | Réponse | Mini-cours | Fausse 1 | Fausse 2 | Type
+                // 8 champs : Chapitre | Question | Réponse | Mini-cours | Fausse 1 | Fausse 2 | Fausse 3 | Type
+                const sevenFieldType = parts.length === 7 ? normType(parts[6]) : undefined;
+                const hasTypeAtEnd = !!sevenFieldType || (parts.length >= 8 && !!normType(parts[7]));
+                const typeIndex = hasTypeAtEnd ? (sevenFieldType ? 6 : 7) : -1;
+                const d3 = typeIndex === 6 ? "" : (parts[6] || "");
+
+                let newCard = {
+                    id: generateId(),
+                    cat: parts[0], q: parts[1], a: parts[2],
+                    expl: parts[3] || "",
+                    d1: parts[4] || "", d2: parts[5] || "", d3,
+                    type: typeIndex >= 0 ? normType(parts[typeIndex]) : undefined,
+                    interval: 0, nextReview: Date.now(), reviews: 0, successes: 0, failures: 0
+                };
+                deckData[newCard.id] = newCard;
+                added++;
             });
             if(added > 0) {
-                saveData(); 
+                saveData();
                 document.getElementById('bulk-text').value = "";
-                alert(`${added} cartes importées avec succès !`);
+                alert(`${added} cartes importées avec succès !${skipped ? `\\n${skipped} ligne(s) ignorée(s) (format incomplet).` : ""}`);
                 updateDashboard();
+            } else if(skipped > 0) {
+                alert(`Aucune carte importée : ${skipped} ligne(s) ont un format incomplet.`);
             }
         }
 
