@@ -592,7 +592,11 @@
             // Les normes \|x\| sont parfois importées sans délimiteurs mathématiques.
             return t.replace(/\\\|([^|\n]+)\\\|/g, (match, inner, offset, whole) => {
                 const before = whole.slice(0, offset);
-                const openDollar = (before.match(/(?<!\\)\$/g) || []).length % 2 === 1;
+                let dollarCount = 0;
+                for (let i = 0; i < before.length; i++) {
+                    if (before[i] === '$' && (i === 0 || before[i - 1] !== '\\')) dollarCount++;
+                }
+                const openDollar = dollarCount % 2 === 1;
                 const openParen = before.lastIndexOf('\\(') > before.lastIndexOf('\\)');
                 return (openDollar || openParen) ? match : '$' + match + '$';
             });
