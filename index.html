@@ -690,6 +690,18 @@
             let n = 0;
             Object.values(deckData).forEach(c => {
                 if (repairCardLaTeX(c)) n++;
+
+                // Réparation ciblée de l'ancien import à 7 champs :
+                // pour ce chapitre uniquement, le type avait été placé dans d3.
+                if ((c.cat || '').trim() === 'Suites et séries de fonctions' && typeof c.d3 === 'string') {
+                    const importedType = normType(c.d3);
+                    if (importedType) {
+                        if (c.type !== importedType) { c.type = importedType; n++; }
+                        c.d3 = '';
+                        n++;
+                    }
+                }
+
                 ['cat','q','a','expl','d1','d2','d3'].forEach(k => {
                     if (typeof c[k] === 'string') {
                         const v = cleanText(c[k]);
